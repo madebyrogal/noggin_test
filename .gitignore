@@ -1,0 +1,10 @@
+# Logs, configs
+/log/*
+!/log/.gitkeep
+/config/config.php
+
+# Vendors
+/vendor
+
+# Others
+/nbproject

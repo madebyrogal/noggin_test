@@ -1,0 +1,638 @@
+<?php
+/**
+ * $Id: pager.lib 6796 2008-11-25 23:13:27Z jesper $
+ *
+ * Alphanumeric Paging Library
+ *  - supports SMTP, PET over TCP
+ *
+ * ------ Terminology ----------
+ *  TAP => Tele-locator Alphanumeric Protocol
+ *  PET => Pager Entry Terminal
+ *  LPH => Link Paging Host
+ *  PUD => PET User Device
+ *  PG1 => Standard PET Mode
+ *  PG3 => Allows Extra 'Destination' Code (Not implemented)
+ *
+ */
+
+// These are only relevent to PETPager::
+define('PET_ESC', chr(0x1B));
+define('PET_STX', chr(0x02));
+define('PET_ETX', chr(0x03));
+define('PET_EOT', chr(0x04));
+define('PET_ACK', chr(0x06));
+define('PET_CR',  chr(0x0D));
+define('PET_NAK', chr(0x15));
+define('PET_RS',  chr(0x1E));
+
+define('PET_ERR_BADPAGERNUM',    '01');
+define('PET_ERR_BADDESTINATION', '02');
+define('PET_ERR_MSGINVALID',     '03');
+define('PET_ERR_MSGTOOLONG',     '04');
+define('PET_ERR_STXMISSING',     '05');
+define('PET_ERR_ETXMISSING',     '06');
+define('PET_ERR_CHECKSUMFMT',    '07');
+define('PET_ERR_TIMEOUT',        '08');
+define('PET_ERR_OUTOFSERVICE',   '09');
+define('PET_ERR_CRTIMEOUT',      '10');
+
+
+define('PET_MODE_PG1', 'PG1');
+define('PET_MODE_PG3', 'PG3');
+
+define('PET_LOGIN_RETRIES',    3);
+define('PET_LOGIN_PACING',     2); // In seconds
+define('PET_SEND_RETRIES',     3);
+define('PET_SEND_MAXLEN',    239); // Max Msg Characters
+
+$_iso_8859_1 = array(
+	chr(0xB5) => 'u',
+	chr(0xC0) => 'A',
+	chr(0xC1) => 'A',
+	chr(0xC2) => 'A',
+	chr(0xC3) => 'A',
+	chr(0xC4) => 'A',
+	chr(0xC5) => 'A',
+	chr(0xC7) => 'C',
+	chr(0xC8) => 'E',
+	chr(0xC9) => 'E',
+	chr(0xCA) => 'E',
+	chr(0xCB) => 'E',
+	chr(0xCC) => 'I',
+	chr(0xCD) => 'I',
+	chr(0xCE) => 'I',
+	chr(0xCF) => 'I',
+	chr(0xD0) => 'D',
+	chr(0xD1) => 'N',
+	chr(0xD2) => 'O',
+	chr(0xD3) => 'O',
+	chr(0xD4) => 'O',
+	chr(0xD5) => 'O',
+	chr(0xD6) => 'O',
+	chr(0xD7) => 'x',
+	chr(0xD8) => 'O',
+	chr(0xD9) => 'U',
+	chr(0xDA) => 'U',
+	chr(0xDB) => 'U',
+	chr(0xDC) => 'U',
+	chr(0xDD) => 'Y',
+	chr(0xDF) => 'B',
+	chr(0xE0) => 'a',
+	chr(0xE1) => 'a',
+	chr(0xE2) => 'a',
+	chr(0xE3) => 'a',
+	chr(0xE4) => 'a',
+	chr(0xE5) => 'a',
+	chr(0xE7) => 'c',
+	chr(0xE8) => 'e',
+	chr(0xE9) => 'e',
+	chr(0xEA) => 'e',
+	chr(0xEB) => 'e',
+	chr(0xEC) => 'i',
+	chr(0xED) => 'i',
+	chr(0xEE) => 'i',
+	chr(0xEF) => 'i',
+	chr(0xF1) => 'n',
+	chr(0xF2) => 'o',
+	chr(0xF3) => 'o',
+	chr(0xF4) => 'o',
+	chr(0xF5) => 'o',
+	chr(0xF6) => 'o',
+	chr(0xF8) => 'o',
+	chr(0xF9) => 'u',
+	chr(0xFA) => 'u',
+	chr(0xFA) => 'u',
+	chr(0xFB) => 'u',
+	chr(0xFC) => 'u',
+	chr(0xFD) => 'y',
+	chr(0xFF) => 'y'
+);
+
+
+// Translate an 8bit ISO-8559-1 string into the nearest equivalent
+// 7-bit string, some 8-bit characters may remain
+function translate_iso8859_1($str) {
+	global $_iso_8859_1;
+	return strtr($str, $_iso_8859_1);
+}
+
+function is_7bit_clean($str) {
+	for ($i=0; $i<strlen($str); $i++) {
+		if (ord($str{$i}) > 127) {
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+
+function clean_8bit($str) {
+	$cleanstr = '';
+	for ($i=0; $i<strlen($str); $i++) {
+		if (ord($str{$i}) <= 127) {
+			$cleanstr .= $str{$i};
+		}
+	}
+	return $cleanstr;
+}
+
+
+/**
+ * SMTPPager sends Alpha-numeric pager messages
+ * via SMTP, there is no need to instantiate
+ * this class, it's member function can be
+ * called statically
+ */
+class SMTPPager {
+	function Send($pagerid, $emaildomain, $message) {
+		// TODO validate recipient
+		$to = SEND_EMAILS_TO_TEST ? TEST_EMAIL : "{$pagerid}@{$emaildomain}";
+		return mail($to, xlate("Page to") . " {$pagerid}", $message, "From: " . SYSTEM_EMAIL . "\r\n", "-f" . SYSTEM_EMAIL);
+	}
+}
+
+
+function od($str) {
+	//$out = "'$str' -> ";
+	for ($i=0; $i<strlen($str); $i++) {
+		$out .= sprintf(" 0x%02X", Ord($str[$i]));
+	}
+	$out .= "\n";
+	return $out;
+}
+
+
+/**
+ * PETPager objects are used to send Alpha-numeric pager
+ * messages via PET (Pager Entry Terminal) gateways over
+ * TCP/IP, the object must be instantiated to specify the
+ * target host/port address and ->login() must be called
+ * to connect & authenticate to the PET gateway before
+ * using the ->send() method
+ */
+
+
+
+
+class PETPager {
+
+	var $loginid;
+	var $mode;
+	var $socket;
+	var $host;
+	var $port;
+	var $_buffer;
+	var $errMsg;//will hold the most recent error message
+
+	function PETPager($host, $port) {
+
+		// This is needed since the Paging Host could use anything and
+		// without it we timeout waiting for a unix line ending
+		assert(ini_get('auto_detect_line_endings'));
+
+		$this->host   = $host;
+		$this->port   = $port;
+		$this->socket = FALSE;
+		$this->_buffer = array();
+		$this->errMsg = "";//initially no errors
+	}
+
+	// Asumes /r or /r/n termination only
+	function _readline($fp) {
+		$line = '';
+
+		while (($c=fgetc($fp)) !== FALSE) {
+			// Leading \n is just hang over from the last line
+			if (strlen($line) == 0 && $c == "\n") continue;
+			$line .= $c;
+			if ($c == "\r") return $line;
+		}
+		return $line;
+	}
+
+	function getline() {
+		if (empty($this->_buffer)) {
+			$tmp = $this->_readline($this->socket);
+			if (strlen($tmp) > 0) {
+				$tmp = str_replace("\r\n", "\n", $tmp);
+				$tmp = str_replace("\r", "\n", $tmp);
+				$tmp = rtrim($tmp, "\n");
+				$this->_buffer = explode("\n", $tmp);
+			}
+		}
+
+		$e = array_shift($this->_buffer);
+		//print date("r") . " ";
+		//print "HUT: " . od($e);
+		//ob_flush();
+		return $e;
+	}
+
+	function putline($line) {
+		//print date("r") . " ";
+		//print "NOG: " . od($line);
+		//ob_flush();
+		fwrite($this->socket, $line);
+		fflush($this->socket);
+	}
+	
+	/**
+	 * toLog() just a stub for logging to error_log and updating $this->errMsg with a 'friendly' message
+	 * @param string $method the method an error occurred in
+	 * @param string $line the line to log
+	 * @param string $friendly something friendly to put in the UI
+	 */
+	function toLog($method="", $line="", $friendly="") {
+		error_log_syslocale("PETPager::{$method}(): {$line}");
+		$this->errMsg = $friendly;
+		return TRUE;
+	}
+
+
+	function login($loginid, $mode=PET_MODE_PG1) {
+		assert($mode == PET_MODE_PG1); // PG3 is not supported -> || $mode == PET_MODE_PG3);
+
+		if (!$this->socket) {
+			$this->socket = fsockopen($this->host, $this->port, $errno, $errstr);
+		}
+
+		// Failed to connect
+		if (!$this->socket) {
+			$this->toLog("login", "service={$this->host}:{$this->port} fsockopen() failed, errno={$errno}, errstr='{$errstr}'", "Unable to connect to service");
+			return FALSE;
+		}
+
+		$this->mode    = $mode;
+		$this->loginid = $loginid;
+
+		// Retry PET_LOGIN_RETRIES times, PET_LOGIN_PACING second pacing
+		$retry = 0;
+		$resp = "";
+		while ($resp != "ID=" && $retry < PET_LOGIN_RETRIES) {
+			if ($retry > 0) {
+				$this->toLog("login", "service={$this->host}:{$this->port} timeout waiting for 'ID=', retry={$retry}, resp='{$resp}'", "A timeout occurred on service login");
+				sleep(PET_LOGIN_PACING);
+			}
+			$this->putline(PET_CR);
+			$resp = $this->getline();
+			$retry++;
+		}
+
+		if ($resp != "ID=") {
+			$this->toLog("login", "service={$this->host}:{$this->port} timeout waiting for 'ID=', resp='{$resp}'", "A timeout occurred waiting for service response");
+			$this->logout();
+			return FALSE;
+		}
+
+		$this->putline(PET_ESC . $this->mode . $this->loginid . PET_CR);
+		$resp = $this->getline();
+		if ($resp[0] != PET_ESC && $resp[0] != PET_NAK && $resp[0] != PET_ACK) {
+			// Got a text message, get the code from the next line
+			$msg = $resp;
+			$resp = $this->getline();
+		}
+
+		// If ! <ACK> then an error occured
+		if ($resp != PET_ACK) {
+			$this->toLog("login", "service={$this->host}:{$this->port} logn failed, expected ACK, resp='{$resp}', msg='{$msg}'", "Service failed to acknowledge");
+			$this->logout();
+			return FALSE;
+		}
+
+		$resp = $this->getline();
+		if ($resp[0] != PET_ESC) {
+			$msg = $resp;
+			$resp = $this->getline();
+		}
+
+		// <ESC>[p<CR> indicates the server is ready for messages
+		// Otherwise assume an error has occured & disconnect
+		if ($resp != (PET_ESC . "[p")) {
+			$this->toLog("login", "service={$this->host}:{$this->port} failed, expected message go-ahead '<ESC>[p', got resp='{$resp}'", "Service not ready to accept messages");
+			$this->logout();
+			return FALSE;
+		}
+
+		$this->toLog("login", "service={$this->host}:{$this->port} OK");
+		return TRUE;
+	}
+
+	/**
+	 * Logout from the PET gateway and close the
+	 * TCP socket
+	 */
+	function logout() {
+		$this->toLog("logout", "service={$this->host}:{$this->port}");
+		assert($this->socket !== FALSE);
+		$this->putline(PET_EOT . PET_CR);
+		$resp = $this->getline();
+		if ($resp[0] != PET_ESC) {
+			$msg = $resp;
+			$resp = $this->getline();
+		}
+		fclose($this->socket);
+		$this->socket = FALSE;
+		return $resp;
+	}
+
+	function send($pagerid, $message, $retry=0) {
+		if ($this->socket == FALSE) return FALSE;
+
+		if ($retry >= PET_SEND_RETRIES) {
+			$this->toLog("send", "failed pager='{$pagerid}', retry count exceeded ({$retry})", "Send failed, too many retries");
+			return FALSE;
+		}
+
+		if (!ereg('^[0-9 ]+$', $pagerid)) return FALSE;
+
+		$this->toLog("send", "pager='{$pagerid}', retry={$retry}", "");
+
+		// \r and \n are illegal, multiple spaces are compressed
+		$message = ereg_replace("(\r|\n)", " ", $message);
+		$message = ereg_replace("  +", " ", $message);
+
+		// Translate ISO-8859-1 entities
+		$message = translate_iso8859_1($message);
+		if (!is_7bit_clean($message)) {
+			// Remove 8bit characters
+			$message = clean_8bit($message);
+			$this->toLog("send", "warning pager='{$pagerid}', message not 7 bit clean, stripped 8-bit chars, original msg='{$message}'", "");
+		}
+
+		if (strlen($message) > PET_SEND_MAXLEN) {
+			$message = substr($message, 0, PET_SEND_MAXLEN);
+		}
+
+		// Build a request & send it
+		$req = PET_STX . $pagerid . PET_CR . $message . PET_CR . PET_ETX;
+		$tosend .= $req . $this->checksum($req) . PET_CR;
+		$this->putline($tosend);
+
+		$resp = $this->getline();
+		if (!in_array($resp[0], array(PET_ACK, PET_NAK, PET_RS, PET_ESC))) {
+			$msg = $resp;
+			$resp = $this->getline();
+		}
+
+		if ($resp[0] == PET_ACK) {
+			$this->toLog("send", "response=ACK pager='{$pagerid}', retry='{$retry}'", "");
+			return TRUE;
+		} else if ($resp[0] == PET_NAK) {
+			$this->toLog("send", "response=NAK (bad checksum?) pager='{$pagerid}', retry='{$retry}'", "Send failed, service not acknowledging");
+			// Bad checksum (corrupted?) try again
+			return $this->send($pagerid, $message, ++$retry);
+		} else if ($resp[0] == PET_ESC && $resp[1] == PET_EOT) {
+			// We have been forced to logout, login and try again
+			$this->toLog("send", "response=EOT (forced logout) pager='{$pagerid}', retry='{$retry}'", "Send failed, service forced log out");
+			$this->logout();
+			if ($this->login($this->loginid, $this->mode)) {
+				return $this->send($pagerid, $message, ++$retry);
+			} else {
+				$this->toLog("send", "logged out at host request (EOT), couldn't log back in. pager='{$pagerid}', retry='{$retry}'", "Send failed, could not log in");
+				// We couldn't log back in for some reason
+				return FALSE;
+			}
+		} else if ($resp[0] == PET_RS) {
+			// Error, the reason code is in $msg (01-10)
+			if ($msg == PET_ERR_MSGINVALID) {
+			 	// The message was modified and sent, log a warning but return TRUE
+				$this->toLog("send", "PET_ERR_MSGINVALID msg='{$message}', pager='{$pagerid}' retry='{$retry}'", "");
+				return TRUE;
+			 } else if ($msg == PET_ERR_MSGTOOLONG) {
+			 	// The message was modified and sent, log a warning but return TRUE
+				$this->toLog("send", "PET_ERR_MSGTOOLONG msg='{$message}', pager='{$pagerid}' retry='{$retry}'", "");
+				return TRUE;
+			} else {
+				$this->toLog("send", "ERROR='{$msg}' msg='{$message}', pager='{$pagerid}' retry='{$retry}'", "Send failed");
+			}
+			return FALSE;
+		} else {
+			$this->toLog("send", "Unknown error condition response='{$msg},{$resp}' msg='{$message}', pager='{$pagerid}' retry='{$retry}'", "Send failed, unknown error");
+			// Error, unknown condition
+			return FALSE;
+		}
+	}
+
+	/**
+	 * Calculate the PET checksum of $message
+	 * returns checksum of $message
+	 */
+	function checksum($message) {
+
+		// Meesage must start with STX and end with ETX
+		//assert(substr($message, 0, 1) == PET_STX);
+		//assert(substr($msssage, -1)   == PET_ETX);
+
+		// Sum all the ASCII values in $message
+		$sum = 0;
+		for ($i=0; $i<strlen($message); $i++) {
+			$sum += ord($message[$i]);
+		}
+
+		// Use the least significant 3 nibbles only
+		$sum &= 0x0FFF;
+
+		$result = chr(((($sum & 0x0F00) >> 8) + ord('0')))
+				. chr(((($sum & 0x00F0) >> 4) + ord('0')))
+				. chr(((($sum & 0x000F) >> 0) + ord('0')));
+
+		return $result;
+	}
+
+}
+
+function checkMessageLength(&$db, $messageid) {
+
+	assert(is_a($db, 'MySQLDatabase'));
+	$message = $db->get('message', "id = {$messageid}");
+	if (!$message) return NULL;
+	$maxallow = 0;
+
+	$SQL = "SELECT MIN(ms.MaxCharLen) AS MaxCharLen "
+	     . "  FROM message_employee me, employee e, messageservice ms "
+	     . " WHERE me.EmployeeID = e.id AND me.MessageID = {$message->id} "
+	     . "   AND e.MessageServiceID = ms.id ";
+
+	$tmp = $db->get($SQL);
+	if ($tmp->MaxCharLen > 0) $maxallow = ($maxallow > 0 ? min($maxallow, $tmp->MaxCharLen) : $tmp->MaxCharLen);
+
+	$SQL = "SELECT MIN(ms.MaxCharLen) AS MaxCharLen "
+	     . "  FROM message_externalmessagenumber me, externalmessagenumber e, messageservice ms "
+	     . " WHERE me.ExternalPagingNumberID = e.id AND me.MessageID = {$message->id} "
+	     . "   AND e.MessageServiceID = ms.id ";
+
+	$tmp = $db->get($SQL);
+	if ($tmp->MaxCharLen > 0) $maxallow = ($maxallow > 0 ? min($maxallow, $tmp->MaxCharLen) : $tmp->MaxCharLen);
+
+	if ($maxallow > 0 && strlen($message->Message) > $maxallow) {
+		return "The message limit for this paging service is {$maxallow} characters, your current message is " . strlen($message->Message) . " characters. Please edit the message to be below the limit so it can be sent. Note: You can send an additional message via the 'Paging System' in the 'Service Centre' menu.";
+	}
+	return NULL;
+}
+
+// include the sms library
+require("sms.lib");
+
+function sendMessage(&$db, $messageid) {
+	global $BRANCHNOW;
+	assert(is_a($db, 'MySQLDatabase'));
+
+	$petsessions = array();
+	$errMsg = "";//last error that occurred, string
+
+	$message = $db->get('message', "id = {$messageid}");
+	if (!$message) return FALSE;
+	$SQL = "(SELECT m.id, 'Emp' AS Type, m.Message, e.id AS TargetID, IF(LEFT(ms.Type,3)='SMS',e.Mobile,e.Pager) AS Destination,\n"
+	     . "        IF(LEFT(ms.Type,3)='SMS',e2.Mobile,e2.Pager) AS Sender,\n"
+	     . "        ms.id AS ServiceID, ms.Type AS ServiceType, ms.Host AS ServiceHost, ms.Port AS ServicePort, ms.User ServiceUser, ms.Password AS ServicePassword, ms.DBName AS ServiceDB, ms.MaxCharLen AS ServiceMaxLength\n"
+	     . "   FROM message m\n"
+	     . "        JOIN message_employee me ON m.id = me.MessageID\n"
+	     . "        JOIN employee e ON me.EmployeeID = e.id AND e.NullIfDeleted IS NOT NULL\n"
+	     . "        JOIN messageservice ms ON e.MessageServiceID = ms.id\n"
+	     . "        LEFT JOIN employee e2 ON IF(m.FromEmployeeID IS NULL, e2.UserID, e2.id) = IFNULL(m.FromEmployeeID,m.FromUserID)\n"
+	     . "  WHERE me.MessageID = {$message->id}\n"
+	     . "        AND me.Status = 'Unsent' AND m.SentDate IS NULL)\n"
+	     . " UNION\n"
+	     . "(SELECT m.id, 'Ext' AS Type, m.Message, e.id AS TargetID, e.Pager AS Destination,\n"
+	     . "        '' AS Sender,\n"
+	     . "        ms.id AS ServiceID, ms.Type AS ServiceType, ms.Host AS ServiceHost, ms.Port AS ServicePort, ms.User ServiceUser, ms.Password AS ServicePassword, ms.DBName AS ServiceDB, ms.MaxCharLen AS ServiceMaxLength\n"
+	     . "   FROM message m\n"
+	     . "        JOIN message_externalmessagenumber me ON m.id = me.MessageID\n"
+	     . "        JOIN externalmessagenumber e ON me.ExternalPagingNumberID = e.id\n"
+	     . "        JOIN messageservice ms ON e.MessageServiceID = ms.id\n"
+	     . "  WHERE me.MessageID = {$message->id}\n"
+	     . "        AND me.Status = 'Unsent' AND m.SentDate IS NULL AND e.Status = 'Available')\n"
+	     . "ORDER BY ServiceID ASC\n";
+
+	// We don't want two processes trying to send the same page!
+	if (!$db->getlock("sendpage")) return FALSE;
+	$i = 0;
+	$sms_override_id      = constant('SMS_OVERRIDE');      // Override the employee setting for service provider if $message->ServiceID === $sms_override_id
+	$sms_override_with_id = constant('SMS_OVERRIDE_WITH'); // Override with this provider
+	$sms_override_service = $db->getnext("messageservice", "id = $sms_override_with_id");
+	while ($message =& $db->getnext($SQL)) {
+		if (SEND_PAGES_TO_TEST === TRUE && $message->ServiceType != 'SMS') $message->Destination = TEST_PAGER;
+
+		if ($message->ServiceID === $sms_override_id) {
+			$service_id     = $sms_override_with_id;
+			$servicetype    = $sms_override_service->Type;
+			$servicehost    = $sms_override_service->Host;
+			$serviceport    = $sms_override_service->Port;
+			$serviceuser    = $sms_override_service->User;
+			$servicepasswd  = $sms_override_service->Password;
+			$service_maxlen = $sms_override_service->MaxCharLen;
+			$service_db     = $sms_override_service->DBName;
+		} else {
+			$service_id     = $message->ServiceID;
+			$servicetype    = $message->ServiceType;
+			$servicehost    = $message->ServiceHost;
+			$serviceport    = $message->ServicePort;
+			$serviceuser    = $message->ServiceUser;
+			$servicepasswd  = $message->ServicePassword;
+			$service_maxlen = $message->ServiceMaxLength;
+			$service_db     = $message->ServiceDB;
+		}
+		switch ($servicetype) {
+			case 'SMTP':
+				$success = SMTPPager::Send($message->Destination, $servicehost, $message->Message);
+				break;
+
+			case 'PET/TCP':
+				$success = FALSE;
+				// Create a new PET session if we haven't seen this service yet
+				if (!$petsessions[$service_id]) {
+					$pet =& new PETPager($servicehost, $serviceport);
+					if ($pet->login($serviceuser)) {
+						$petsessions[$service_id] =& $pet;
+					}
+					//store error message from the login process
+					$errMsg = $pet->errMsg;
+				}
+
+				// If we have a service, then try to send the page
+				if ($petsessions[$service_id]) {
+					$pet =& $petsessions[$service_id];
+					$success = $pet->send($message->Destination, $message->Message);
+					//store error message from the send process
+					$errMsg = $pet->errMsg;
+				}
+				break;
+
+			case 'SMS':
+				if (SEND_PAGES_TO_TEST === TRUE && !in_array($message->Destination, array("+61402273001", "+61412958512", "+61407720764", "+61411289645", "+61415151831", "+61401167818"))) {
+					$message->Destination = TEST_SMS;
+				}
+				$success = FALSE;
+				$sms =& new SMS($servicehost, $serviceport);
+				if ($sms) {
+					$success = $sms->send($message->Destination, $message->Message, $message->id);
+				}
+				break;
+
+			case 'SMS-AUS':
+				if (SEND_PAGES_TO_TEST === TRUE && !in_array($message->Destination, array("+61402273001", "+61412958512", "+61407720764", "+61411289645", "+61415151831", "+61401167818"))) {
+					$message->Destination = TEST_SMS;
+				}
+				$success = FALSE;
+				$verbose = FALSE;
+				$sms =& new SMS_AUS($servicehost, $serviceport, $verbose);
+				if ($sms) {
+					$success = $sms->send($serviceuser, $servicepasswd, $service_maxlen, $message->Destination, $message->Message, $message->id);
+					$errMsg = $sms->errMsg();
+				}
+				break;
+
+			case 'SMS-KOREA': // Korean SMS - see issue #5223
+				if (extension_loaded('mssql')) {
+					include_once(SYSTEM_DIR . '/libs/database_mssql.lib');
+
+					if (SEND_PAGES_TO_TEST === TRUE &&  !in_array($message->Destination, array("+61402273001", "+61412958512", "+61407720764", "+61411289645", "+61415151831", "+61401167818"))) {
+						$message->Destination = TEST_SMS;
+					}
+					$success = FALSE;
+					$mssql = Database::Create(DBENGINE_MSSQL, $service_db, $serviceuser, $servicepasswd, FALSE, $servicehost, $serviceport);
+
+					$savedata = array();
+					$savedata['TR_SENDDATE'] = "getdate()";
+					$savedata['TR_SENDSTAT'] = $mssql->quote('0');
+					$savedata['TR_RSLTSTAT'] = $mssql->quote('00');
+					$savedata['TR_PHONE']    = $mssql->quote($message->Destination); // receiver mobile no
+					$savedata['TR_CALLBACK'] = $mssql->quote($message->Sender); // sender mobile no.
+					$savedata['TR_MSG']      = $mssql->quote($message->Message);
+
+					$success = FALSE;
+					if ($mssql->insert('SC_TRAN', $savedata) !== FALSE) $success = TRUE;
+				} else {
+					$success = FALSE;
+				}
+				break;
+
+			case 'BLACKHOLE':
+				$result = FALSE;
+				break;
+		}
+		$result = $success ? "'Successful'" : "'Failed'";
+		$savedata =  array();
+		$savedata['Status'] = $result;
+		if($errMsg != "") {
+			$savedata['ErrorMessage'] = $db->quote($errMsg);
+		}
+		if ($message->Type == 'Emp') {
+			$db->update("message_employee", $savedata, "MessageID = {$message->id} AND EmployeeID = {$message->TargetID}");
+		} else if ($message->Type == 'Ext') {
+			$db->update("message_externalmessagenumber", $savedata, "MessageID = {$message->id} AND ExternalPagingNumberID = {$message->TargetID}");
+		}
+		if ($success) $i++;
+	}
+	$db->update("message", array("SentDate" => $BRANCHNOW), "id = {$messageid}");
+	$db->releaselock("sendpage");
+
+	// Logout from any PET sessions we opened
+	foreach(array_keys($petsessions) as $id) {
+		// ->logout() will close the socket regardless of success/failure
+		$petsessions[$id]->logout();
+	}
+	// $i is Number of Successful pages sent (ie destinations)
+	return $i;
+}
+
+?>
